@@ -31,10 +31,10 @@ doctest!("../README.md");
 
 use core::mem;
 use core::pin::Pin;
-use futures::stream::{Fuse, FusedStream, Stream};
+use futures::stream::{Fuse, FusedStream, IntoStream, Stream, TryChunksError};
 use futures::task::{Context, Poll};
-use futures::Future;
 use futures::StreamExt;
+use futures::{Future, TryStream, TryStreamExt};
 #[cfg(feature = "sink")]
 use futures_sink::Sink;
 use pin_utils::{unsafe_pinned, unsafe_unpinned};
@@ -53,6 +53,16 @@ pub trait ChunksTimeoutStreamExt: Stream {
     }
 }
 impl<T: ?Sized> ChunksTimeoutStreamExt for T where T: Stream {}
+
+pub trait TryChunksTimeoutStreamExt: TryStream {
+    fn try_chunks_timeout(self, capacity: usize, duration: Duration) -> TryChunksTimeout<Self>
+    where
+        Self: Sized,
+    {
+        TryChunksTimeout::new(self, capacity, duration)
+    }
+}
+impl<T: ?Sized> TryChunksTimeoutStreamExt for T where T: TryStream {}
 
 /// A Stream of chunks.
 #[derive(Debug)]
@@ -219,6 +229,159 @@ where
     delegate_sink!(stream, Item);
 }
 
+#[derive(Debug)]
+#[must_use = "streams do nothing unless polled"]
+pub struct TryChunksTimeout<St: TryStream> {
+    stream: Fuse<IntoStream<St>>,
+    items: Vec<St::Ok>,
+    cap: usize,
+    clock: Option<Delay>,
+    duration: Duration,
+}
+
+impl<St: Unpin + TryStream> Unpin for TryChunksTimeout<St> {}
+
+impl<St: TryStream> TryChunksTimeout<St> {
+    unsafe_unpinned!(items: Vec<St::Ok>);
+    unsafe_pinned!(clock: Option<Delay>);
+    unsafe_pinned!(stream: Fuse<IntoStream<St>>);
+
+    pub fn new(stream: St, capacity: usize, duration: Duration) -> Self {
+        Self {
+            stream: stream.into_stream().fuse(),
+            items: Vec::with_capacity(capacity),
+            cap: capacity,
+            clock: None,
+            duration,
+        }
+    }
+
+    fn take(mut self: Pin<&mut Self>) -> Vec<St::Ok> {
+        let cap = self.cap;
+        mem::replace(self.as_mut().items(), Vec::with_capacity(cap))
+    }
+
+    /// Acquires a reference to the underlying stream that this combinator is
+    /// pulling from.
+    pub fn get_ref(&self) -> &St {
+        self.stream.get_ref().get_ref()
+    }
+
+    /// Acquires a mutable reference to the underlying stream that this
+    /// combinator is pulling from.
+    ///
+    /// Note that care must be taken to avoid tampering with the state of the
+    /// stream which may otherwise confuse this combinator.
+    pub fn get_mut(&mut self) -> &mut St {
+        self.stream.get_mut().get_mut()
+    }
+
+    /// Acquires a pinned mutable reference to the underlying stream that this
+    /// combinator is pulling from.
+    ///
+    /// Note that care must be taken to avoid tampering with the state of the
+    /// stream which may otherwise confuse this combinator.
+    pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut St> {
+        self.stream().get_pin_mut().get_pin_mut()
+    }
+
+    /// Consumes this combinator, returning the underlying stream.
+    ///
+    /// Note that this may discard intermediate state of this combinator, so
+    /// care should be taken to avoid losing resources when this is called.
+    pub fn into_inner(self) -> St {
+        self.stream.into_inner().into_inner()
+    }
+}
+
+impl<St: TryStream> Stream for TryChunksTimeout<St> {
+    type Item = Result<Vec<St::Ok>, TryChunksError<St::Ok, St::Error>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.as_mut().stream().poll_next(cx) {
+                Poll::Ready(item) => match item {
+                    Some(item) => match item {
+                        Ok(item) => {
+                            if self.items.is_empty() {
+                                *self.as_mut().clock() = Some(Delay::new(self.duration));
+                            }
+                            self.as_mut().items().push(item);
+                            if self.items.len() >= self.cap {
+                                *self.as_mut().clock() = None;
+                                return Poll::Ready(Some(Ok(self.as_mut().take())));
+                            } else {
+                                continue;
+                            }
+                        }
+                        Err(err) => {
+                            *self.as_mut().clock() = None;
+                            return Poll::Ready(Some(Err(TryChunksError(
+                                self.as_mut().take(),
+                                err,
+                            ))));
+                        }
+                    },
+                    None => {
+                        let last = if self.items.is_empty() {
+                            None
+                        } else {
+                            Some(Ok(mem::take(self.as_mut().items())))
+                        };
+                        return Poll::Ready(last);
+                    }
+                },
+                Poll::Pending => {}
+            }
+
+            match self
+                .as_mut()
+                .clock()
+                .as_pin_mut()
+                .map(|clock| clock.poll(cx))
+            {
+                Some(Poll::Ready(())) => {
+                    *self.as_mut().clock() = None;
+                    return Poll::Ready(Some(Ok(self.as_mut().take())));
+                }
+                Some(Poll::Pending) => {}
+                None => {
+                    debug_assert!(
+                        self.items().is_empty(),
+                        "Inner buffer is empty, but clock is available."
+                    );
+                }
+            }
+
+            return Poll::Pending;
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let chunk_len = if self.items.is_empty() { 0 } else { 1 };
+        let (lower, upper) = self.stream.size_hint();
+        let lower = lower.saturating_add(chunk_len);
+        let upper = upper.and_then(|x| x.checked_add(chunk_len));
+        (lower, upper)
+    }
+}
+
+impl<St: FusedStream + TryStream> FusedStream for TryChunksTimeout<St> {
+    fn is_terminated(&self) -> bool {
+        self.stream.is_terminated() && self.items.is_empty()
+    }
+}
+
+#[cfg(feature = "sink")]
+impl<S, Item> Sink<Item> for TryChunksTimeout<S>
+where
+    S: TryStream + Sink<Item>,
+{
+    type Error = <S as Sink<Item>>::Error;
+
+    delegate_sink!(stream, Item);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +398,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_messages_pass_through() {
+        let results = stream::iter(iter::once(Ok::<_, ()>(5)))
+            .try_chunks_timeout(5, Duration::new(1, 0))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(vec![Ok(vec![5])], results);
+    }
+
+    #[tokio::test]
     async fn message_chunks() {
         let stream = stream::iter(0..10);
 
@@ -246,6 +418,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_message_chunks() {
+        let stream = stream::iter((0..10).map(Ok::<_, ()>));
+
+        let results = stream
+            .try_chunks_timeout(5, Duration::new(1, 0))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            vec![Ok(vec![0, 1, 2, 3, 4]), Ok(vec![5, 6, 7, 8, 9])],
+            results
+        )
+    }
+
+    #[tokio::test]
     async fn message_early_exit() {
         let iter = vec![1, 2, 3, 4].into_iter();
         let stream = stream::iter(iter);
@@ -254,6 +440,45 @@ mod tests {
         assert_eq!(
             vec![vec![1, 2, 3, 4]],
             chunk_stream.collect::<Vec<_>>().await
+        );
+    }
+
+    #[tokio::test]
+    async fn try_message_early_exit() {
+        let stream = stream::iter([1, 2, 3, 4]).map(Ok::<_, ()>);
+
+        let results = stream
+            .try_chunks_timeout(5, Duration::new(1, 0))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(vec![Ok(vec![1, 2, 3, 4])], results);
+    }
+
+    #[tokio::test]
+    async fn try_message_early_error() {
+        let stream = stream::iter([
+            Ok::<_, ()>(1),
+            Ok(2),
+            Ok(3),
+            Ok(4),
+            Ok(5),
+            Err(()),
+            Ok(6),
+            Ok(7),
+            Ok(8),
+        ]);
+
+        let results = stream
+            .try_chunks_timeout(3, Duration::new(1, 0))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            vec![
+                Ok(vec![1, 2, 3]),
+                Err(TryChunksError(vec![4, 5], ())),
+                Ok(vec![6, 7, 8])
+            ],
+            results
         );
     }
 
@@ -290,5 +515,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(results.await, expected);
+    }
+
+    #[tokio::test]
+    async fn try_messages_timeout() {
+        let stream0 = stream::iter([1, 2, 3, 4]);
+        let stream1 =
+            stream::iter([5]).then(move |n| Delay::new(Duration::from_millis(300)).map(move |_| n));
+        let stream2 = stream::iter([6, 7, 8]);
+
+        let stream = stream0.chain(stream1).chain(stream2).map(Ok::<_, ()>);
+        let chunk_stream = stream.try_chunks_timeout(5, Duration::from_millis(100));
+
+        let now = Instant::now();
+        let min_times = [Duration::from_millis(80), Duration::from_millis(150)];
+        let max_times = [Duration::from_millis(350), Duration::from_millis(500)];
+        let expected = vec![Ok(vec![1, 2, 3, 4]), Ok(vec![5, 6, 7, 8])];
+        let mut i = 0;
+
+        let results = chunk_stream
+            .map(move |s| {
+                let now2 = Instant::now();
+                println!("{}: {:?} {:?}", i, now2 - now, s);
+                assert!((now2 - now) < max_times[i]);
+                assert!((now2 - now) > min_times[i]);
+                i += 1;
+                s
+            })
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(results, expected);
     }
 }
